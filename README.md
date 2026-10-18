@@ -31,12 +31,20 @@ The sample data has three planted problems for the quality checks to find: a dup
 
 ## Security
 
-Access to the deployed server is protected by two independent layers:
+The deployed server is protected in layers, from the network edge inwards:
 
-1. **Bearer token authentication.** Every request except `/health` must send `Authorization: Bearer <token>`. Requests without a valid token are rejected with `401`, and the server refuses to start on a public address without a token.
-2. **IP allowlist (Azure App Service access restrictions).** Only approved IP addresses can reach the app. All other traffic is denied with `403` before it reaches the application, so a stolen token alone is not enough to get in.
+| Layer | Control | What it stops |
+|---|---|---|
+| 1. Network | **IP allowlist** (Azure App Service access restrictions) | Any address not on the list gets `403` before reaching the app, so a stolen token alone is not enough |
+| 2. Abuse | **Rate limiting**: 60 requests per minute per client IP (`RATE_LIMIT_PER_MINUTE`) | Brute-force token guessing and runaway AI loops; extra requests get `429` and are audited |
+| 3. Identity | **Bearer token authentication** | Every request except `/health` needs `Authorization: Bearer <token>`; anything else gets `401` and is audited |
+| 4. Secrets | **Azure Key Vault + managed identity** | The token is stored in Key Vault and read by the app's own Azure identity, so no secret sits in app settings or code. If the reference fails to resolve, the server refuses to start |
+| 5. Data | **Read-only connection, SQLite authorizer, dataset allow-list, 200-row cap, 5-second query timeout** (`QUERY_TIMEOUT_SECONDS`) | Writes, system tables, oversized results and expensive queries |
+| 6. Evidence | **JSON audit log** | Every tool call, denial, timeout and rate-limit event is recorded |
 
-Additional safeguards: HTTPS only, Host-header validation against DNS rebinding, a read-only database connection with an engine-level SQL authorizer, and a JSON audit log of every tool call. Secrets live in Azure app settings and are never committed to the repository.
+Also: HTTPS only, FTP deployment disabled, Host-header validation against DNS rebinding, and Dependabot alerts on dependencies. Secrets are never committed to the repository.
+
+**Next step:** replace the shared token with Microsoft Entra ID (OAuth) so each user signs in with their own identity and tools are granted by role.
 
 ## Document search (RAG retrieval)
 

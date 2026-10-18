@@ -5,7 +5,8 @@ Model Context Protocol (MCP), with governance built in:
 
   * read-only access (database opened read-only + a SQLite authorizer)
   * an allow-list of datasets the AI may see
-  * a row limit on every query
+  * a row limit and a time limit on every query
+  * per-client rate limiting on the HTTP endpoint
   * an audit log of every tool call (audit.log, one JSON line per call)
 
 Tools:      list_datasets, describe_dataset, query_data,
@@ -25,6 +26,8 @@ import json
 import os
 import sqlite3
 import sys
+import time
+from collections import defaultdict, deque
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -39,6 +42,8 @@ BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "portfolio.db"
 AUDIT_LOG = Path(os.environ.get("AUDIT_LOG", BASE_DIR / "audit.log"))  # set to a persistent path when hosted
 MAX_ROWS = 200
+QUERY_TIMEOUT_SECONDS = float(os.environ.get("QUERY_TIMEOUT_SECONDS", "5"))  # cancel slow AI-written SQL
+RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "60"))  # HTTP requests per client IP
 
 # Governance: only these datasets are visible to the AI, with a business description.
 ALLOWED_DATASETS: dict[str, str] = {
@@ -152,12 +157,22 @@ def query_data(sql: str) -> dict[str, Any]:
         if not stripped.lower().startswith(("select", "with")):
             raise ToolError("Only SELECT queries are allowed.")
         with _connect() as con:
+            # Query timeout: SQLite calls this handler every 10,000 steps; returning 1 cancels the query.
+            deadline = time.monotonic() + QUERY_TIMEOUT_SECONDS
+            con.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 10_000)
             cur = con.execute(stripped)
             rows = _rows(cur, MAX_ROWS + 1)
         truncated = len(rows) > MAX_ROWS
         rows = rows[:MAX_ROWS]
         _audit("query_data", args, "ok", rows=len(rows))
         return {"row_count": len(rows), "truncated": truncated, "rows": rows}
+    except sqlite3.OperationalError as e:
+        if "interrupted" in str(e):
+            _audit("query_data", args, "timeout", error=f"cancelled after {QUERY_TIMEOUT_SECONDS:g}s")
+            raise ToolError(f"Query cancelled: it ran longer than {QUERY_TIMEOUT_SECONDS:g} seconds. "
+                            "Add filters or aggregate the data.") from e
+        _audit("query_data", args, "denied", error=str(e))
+        raise ToolError("Query blocked by governance rules or invalid SQL: " + str(e)) from e
     except sqlite3.DatabaseError as e:
         msg = "Query blocked by governance rules or invalid SQL: " + str(e)
         _audit("query_data", args, "denied", error=str(e))
@@ -364,6 +379,10 @@ def build_http_app():
     host = os.environ.get("HOST", "127.0.0.1")
     if host not in ("127.0.0.1", "localhost") and not token:
         raise SystemExit("Refusing to start: set MCP_API_TOKEN before exposing the server on a network.")
+    if token.startswith("@Microsoft.KeyVault"):
+        # Azure leaves the raw reference in place when it cannot read the secret from Key Vault.
+        raise SystemExit("Refusing to start: the Key Vault reference for MCP_API_TOKEN did not resolve. "
+                         "Check the app's managed identity and its 'Key Vault Secrets User' role.")
 
     allowed = [h.strip() for h in os.environ.get("ALLOWED_HOSTS", "").split(",") if h.strip()]
     security = (
@@ -381,8 +400,37 @@ def build_http_app():
 
     app = mcp.streamable_http_app(stateless_http=True, json_response=True, transport_security=security, host=host)
 
+    recent: dict[str, deque[float]] = defaultdict(deque)  # client IP -> request times in the last minute
+
+    def _client_ip(scope) -> str:
+        # Behind Azure's front end the caller's address arrives in X-Forwarded-For ("ip:port, proxy, ...").
+        headers = dict(scope.get("headers") or [])
+        forwarded = headers.get(b"x-forwarded-for", b"").decode().split(",")[0].strip()
+        if forwarded:
+            return forwarded.rsplit(":", 1)[0] if forwarded.count(":") == 1 else forwarded
+        return (scope.get("client") or ("unknown", 0))[0]
+
+    def _rate_limited(ip: str) -> bool:
+        now = time.monotonic()
+        window = recent[ip]
+        while window and now - window[0] > 60:
+            window.popleft()
+        if len(window) >= RATE_LIMIT_PER_MINUTE:
+            return True
+        window.append(now)
+        return False
+
     async def bearer_auth(scope, receive, send):
-        """Require 'Authorization: Bearer <MCP_API_TOKEN>' on everything except /health."""
+        """Rate-limit per client IP, then require 'Authorization: Bearer <MCP_API_TOKEN>'.
+        /health is exempt from both."""
+        if scope["type"] == "http" and scope["path"] != "/health":
+            ip = _client_ip(scope)
+            if _rate_limited(ip):
+                _audit("http_rate_limit", {"path": scope["path"], "ip": ip}, "denied",
+                       error=f"more than {RATE_LIMIT_PER_MINUTE} requests per minute")
+                response = JSONResponse({"error": "too many requests"}, status_code=429, headers={"Retry-After": "60"})
+                await response(scope, receive, send)
+                return
         if scope["type"] == "http" and token and scope["path"] != "/health":
             headers = dict(scope.get("headers") or [])
             supplied = headers.get(b"authorization", b"").decode()
