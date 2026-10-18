@@ -29,6 +29,15 @@ Built with the official MCP Python SDK **v2** (`MCPServer`).
 
 The sample data has three planted problems for the quality checks to find: a duplicated Alter Domus distribution, a cashflow missing its CAD amount, and a fund with a stale NAV.
 
+## Security
+
+Access to the deployed server is protected by two independent layers:
+
+1. **Bearer token authentication.** Every request except `/health` must send `Authorization: Bearer <token>`. Requests without a valid token are rejected with `401`, and the server refuses to start on a public address without a token.
+2. **IP allowlist (Azure App Service access restrictions).** Only approved IP addresses can reach the app. All other traffic is denied with `403` before it reaches the application, so a stolen token alone is not enough to get in.
+
+Additional safeguards: HTTPS only, Host-header validation against DNS rebinding, a read-only database connection with an engine-level SQL authorizer, and a JSON audit log of every tool call. Secrets live in Azure app settings and are never committed to the repository.
+
 ## Document search (RAG retrieval)
 
 ```

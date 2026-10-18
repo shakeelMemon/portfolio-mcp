@@ -3,3 +3,4 @@ docs.db
 audit.log
 .venv/
 __pycache__/
+deploy.zip
